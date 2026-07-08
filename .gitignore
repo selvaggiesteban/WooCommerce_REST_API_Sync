@@ -1,0 +1,38 @@
+# Dependencies
+/vendor/
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# WordPress
+wp-config.php
+wp-content/uploads/
+wp-content/cache/
+wp-content/upgrade/
+
+# Logs
+*.log
+wp-content/wc-api-sync.log
+wp-content/wc-api-sync.log.*.bak
+
+# Temp
+wp-content/wc-api-sync-temp/
+
+# Build
+*.zip
+*.tar.gz
+dist/
+
+# Test
+.phpunit.result.cache
+.phpunit.cache/
+coverage/
