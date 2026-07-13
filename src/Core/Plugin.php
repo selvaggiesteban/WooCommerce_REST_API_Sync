@@ -161,6 +161,9 @@ class Plugin
                     ],
                 ],
             ]);
+
+            $webhook_receiver = new \WooCommerceApiSync\Webhooks\WebhookReceiver($this->config, $this->event_bus);
+            $webhook_receiver->register_routes();
         });
     }
 

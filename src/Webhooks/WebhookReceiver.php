@@ -142,7 +142,7 @@ class WebhookReceiver
     public function handle_webhook(\WP_REST_Request $request): \WP_REST_Response
     {
         $topic = $request->get_param('topic');
-        $body = json_decode($request->get_body(), true);
+        $body = json_decode($request->get_body(), true) ?? [];
 
         $this->logger->info("Webhook received: {$topic}");
 
