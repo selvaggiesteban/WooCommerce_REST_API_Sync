@@ -13,7 +13,7 @@ $config = new Config();
 $settings = $config->all();
 
 // Handle form submission
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['wc_api_sync_settings'])) {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'wc_api_sync_save') {
     check_admin_referer('wc_api_sync_settings');
     
     $new_settings = [
@@ -45,6 +45,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['wc_api_sync_settings'
     
     <form method="post" action="">
         <?php wp_nonce_field('wc_api_sync_settings'); ?>
+        <input type="hidden" name="action" value="wc_api_sync_save" />
         
         <h2><?php esc_html_e('API Configuration', 'wc-api-sync'); ?></h2>
         <table class="form-table">
