@@ -94,22 +94,9 @@ class GitHubUpdater
             return;
         }
 
-        // Set the release asset filename pattern
-        $this->updater->setReleaseAssetPattern('wc-api-sync-{version}.zip');
+        add_filter('puc_json_metadata_wc-api-sync', [$this, 'filter_metadata'], 10, 2);
 
-        // Add custom metadata filter
-        add_filter('puc_json_metadata_{slug}', [$this, 'filter_metadata'], 10, 2);
-
-        // Add admin notice for updates
         add_action('admin_notices', [$this, 'admin_update_notice']);
-
-        // Add "Check for updates" link
-        add_filter(
-            'puc_configure_plugin_update_link_{slug}',
-            [$this, 'configure_update_link'],
-            10,
-            2
-        );
     }
 
     /**

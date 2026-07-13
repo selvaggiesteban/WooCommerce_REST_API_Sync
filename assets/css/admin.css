@@ -1,0 +1,13 @@
+/* WC API Sync Admin Styles */
+.wrap h1 {
+    margin-bottom: 20px;
+}
+.form-table th {
+    width: 200px;
+}
+#sync-status {
+    background: #fff;
+    border: 1px solid #ccd0d4;
+    padding: 15px;
+    margin-top: 10px;
+}
