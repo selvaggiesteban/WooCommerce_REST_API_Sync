@@ -39,7 +39,13 @@ class Config
      */
     private function load(): void
     {
-        $this->values = get_option(self::OPTION_NAME, []);
+        $raw = get_option(self::OPTION_NAME, []);
+        if (is_string($raw)) {
+            $decoded = json_decode($raw, true);
+            $this->values = is_array($decoded) ? $decoded : [];
+        } else {
+            $this->values = is_array($raw) ? $raw : [];
+        }
     }
 
     /**
