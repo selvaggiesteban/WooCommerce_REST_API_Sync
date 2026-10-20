@@ -1,73 +1,80 @@
 <?php
 /**
- * Mayrea Sync Feature
+ * External Feed Sync Feature
  *
- * Price, stock and SKU sync from the StProductos external API.
- * Only updates existing products; never creates or deletes them.
- * Scheduled four times daily (00:00, 06:00, 12:00, 18:00 site time)
- * plus manual runs via POST /wp-json/wc-api-sync/v1/sync/mayrea.
+ * Generic price/stock sync from an external JSON feed. The feed URL,
+ * field mapping and frequency are site configuration (WC API Sync >
+ * Settings, or the wc_api_sync_external_feed_config filter); without
+ * configuration the feature stays idle.
+ *
+ * Runs are dispatched through the plugin queue (job type external_feed)
+ * and batched via Action Scheduler with a time budget.
  *
  * @package WooCommerceApiSync\Features
  */
 
 namespace WooCommerceApiSync\Features;
 
+use WooCommerceApiSync\Core\Config;
 use WooCommerceApiSync\Core\Queue;
 use WooCommerceApiSync\Utils\Logger;
 
 defined('ABSPATH') || exit;
 
 /**
- * Mayrea price/stock sync engine
+ * External feed price/stock sync engine
  */
-class MayreaSync
+class ExternalFeedSync
 {
     /**
      * Queue job type handled by this feature
      */
-    public const JOB_TYPE = 'mayrea_sync';
+    public const JOB_TYPE = 'external_feed';
 
     /**
-     * StProductos stock API endpoint
+     * Supported scheduling frequencies (settings select values)
      */
-    private const API_URL = 'https://aguilaapi.com/api/StProductos/sitio/dwaguila3g_mayrea/stock';
+    public const FREQUENCIES = ['daily', 'twicedaily', 'fourtimesdaily', 'sixhourly', 'twelvehourly'];
 
     /**
      * Action Scheduler hooks
      */
-    private const HOOK_RUN = 'wc_api_sync_mayrea_run';
-    private const HOOK_BATCH = 'wc_api_sync_mayrea_batch';
-    private const GROUP = 'mayrea-sync';
+    private const HOOK_RUN = 'wc_api_sync_external_feed_run';
+    private const HOOK_BATCH = 'wc_api_sync_external_feed_batch';
+    private const GROUP = 'wc-external-feed';
 
     /**
      * Safety thresholds
      */
-    private const MIN_RECORDS = 1000;
     private const BATCH_SIZE = 300;
     private const TIME_BUDGET = 15;
     private const SNAPSHOT_TTL = 3 * HOUR_IN_SECONDS;
-    private const RUN_INTERVAL = 6 * HOUR_IN_SECONDS;
+    private const DEFAULT_MIN_RECORDS = 1000;
 
     /**
      * Options and transient keys
      */
-    private const OPT_RUN = '_mayrea_sync_current';
-    private const OPT_LAST = '_mayrea_sync_last_run';
-    private const OPT_ERROR = '_mayrea_sync_last_error';
-    private const OPT_LOCK = '_mayrea_sync_running';
-    private const OPT_CHECK = '_mayrea_sync_sched_check';
-    private const TRANSIENT = '_mayrea_sync_snapshot';
+    private const OPT_RUN = '_wc_ext_feed_current';
+    private const OPT_LAST = '_wc_ext_feed_last_run';
+    private const OPT_ERROR = '_wc_ext_feed_last_error';
+    private const OPT_LOCK = '_wc_ext_feed_running';
+    private const OPT_CHECK = '_wc_ext_feed_sched_check';
+    private const OPT_SCHED_FREQ = '_wc_ext_feed_sched_freq';
+    private const TRANSIENT = '_wc_ext_feed_snapshot';
 
+    private Config $config;
     private Queue $queue;
     private Logger $logger;
 
     /**
-     * @param Queue $queue Plugin job queue
+     * @param Config $config Plugin configuration
+     * @param Queue  $queue  Plugin job queue
      */
-    public function __construct(Queue $queue)
+    public function __construct(Config $config, Queue $queue)
     {
+        $this->config = $config;
         $this->queue = $queue;
-        $this->logger = new Logger('mayrea');
+        $this->logger = new Logger('feed');
     }
 
     /**
@@ -79,20 +86,66 @@ class MayreaSync
         add_action(self::HOOK_RUN, [$this, 'enqueue_run']);
         add_action(self::HOOK_BATCH, [$this, 'batch'], 10, 1);
         add_action('init', [$this, 'maybe_schedule'], 20);
+
+        add_action('update_option_wc_api_sync_settings', function () {
+            delete_option(self::OPT_CHECK);
+        });
     }
 
     /**
-     * Enqueue a sync run through the plugin queue and wake the queue runner
+     * Effective feed configuration (settings + filter), normalized
+     */
+    public function get_config(): array
+    {
+        $config = apply_filters('wc_api_sync_external_feed_config', [
+            'url' => $this->config->get('feed_url', ''),
+            'sku' => $this->config->get('feed_sku', ''),
+            'price' => $this->config->get('feed_price', ''),
+            'stock' => $this->config->get('feed_stock', ''),
+            'frequency' => $this->config->get('feed_frequency', ''),
+            'min_records' => $this->config->get('feed_min_records', self::DEFAULT_MIN_RECORDS),
+        ]);
+
+        return [
+            'url' => trim((string) ($config['url'] ?? '')),
+            'sku' => trim((string) ($config['sku'] ?? '')),
+            'price' => trim((string) ($config['price'] ?? '')),
+            'stock' => trim((string) ($config['stock'] ?? '')),
+            'frequency' => in_array(($config['frequency'] ?? ''), self::FREQUENCIES, true) ? $config['frequency'] : '',
+            'min_records' => max(1, (int) ($config['min_records'] ?? self::DEFAULT_MIN_RECORDS)),
+        ];
+    }
+
+    /**
+     * Whether URL and field mapping are set (required to run)
+     */
+    public function has_payload_config(): bool
+    {
+        $cfg = $this->get_config();
+        return '' !== $cfg['url'] && '' !== $cfg['sku'] && '' !== $cfg['price'] && '' !== $cfg['stock'];
+    }
+
+    /**
+     * Whether the feed is fully configured including frequency
+     */
+    public function is_configured(): bool
+    {
+        $cfg = $this->get_config();
+        return $this->has_payload_config() && '' !== $cfg['frequency'];
+    }
+
+    /**
+     * Queue a sync run and wake the queue runner
      *
-     * @param string $source Trigger source (rest|schedule)
+     * @param string $source Trigger source (rest|manual|schedule)
      * @return int Job ID
      */
-    public function enqueue_job(string $source = 'rest'): int
+    public function enqueue_job(string $source = 'manual'): int
     {
         $job_id = $this->queue->add_job(self::JOB_TYPE, ['source' => $source]);
 
         if (function_exists('as_schedule_async_action')) {
-            as_schedule_async_action('wc_api_sync_process_queue', [], self::GROUP);
+            as_schedule_async_action('wc_api_sync_process_queue');
         }
 
         return $job_id;
@@ -116,8 +169,12 @@ class MayreaSync
      */
     public function enqueue_run(): void
     {
+        if (!$this->has_payload_config()) {
+            return;
+        }
+
         if ($this->is_running()) {
-            $this->logger->info('Corrida programada omitida: ya hay una sincronización en curso.');
+            $this->logger->info('Scheduled feed run skipped: a sync is already in progress.');
             return;
         }
 
@@ -125,7 +182,8 @@ class MayreaSync
     }
 
     /**
-     * Self-heal: keep the recurring run scheduled (hourly throttle)
+     * Self-heal: keep the recurring run in sync with the configured
+     * frequency (hourly throttle, forced again on settings changes)
      */
     public function maybe_schedule(): void
     {
@@ -138,48 +196,111 @@ class MayreaSync
         if (!function_exists('as_schedule_recurring_action')) {
             return;
         }
-        if (as_has_scheduled_action(self::HOOK_RUN)) {
+
+        $frequency = $this->get_config()['frequency'];
+
+        if (!$this->is_configured()) {
+            if (function_exists('as_unschedule_action') && as_has_scheduled_action(self::HOOK_RUN)) {
+                as_unschedule_action(self::HOOK_RUN);
+            }
+            delete_option(self::OPT_SCHED_FREQ);
             return;
         }
 
-        as_schedule_recurring_action(
-            self::next_slot(),
-            self::RUN_INTERVAL,
-            self::HOOK_RUN,
-            [],
-            self::GROUP
-        );
+        $scheduled_frequency = (string) get_option(self::OPT_SCHED_FREQ, '');
+        if (as_has_scheduled_action(self::HOOK_RUN) && $scheduled_frequency === $frequency) {
+            return;
+        }
 
-        $this->logger->info('Programación reparada: corrida recurrente reagendada.');
+        if (as_has_scheduled_action(self::HOOK_RUN)) {
+            as_unschedule_action(self::HOOK_RUN);
+        }
+
+        [$next, $interval] = self::schedule_params($frequency);
+        if ($next <= 0 || $interval <= 0) {
+            return;
+        }
+
+        as_schedule_recurring_action($next, $interval, self::HOOK_RUN, [], self::GROUP);
+        update_option(self::OPT_SCHED_FREQ, $frequency, false);
+        $this->logger->info('Feed schedule updated: ' . $frequency);
     }
 
     /**
-     * Next run slot anchored to 00:00, 06:00, 12:00, 18:00
+     * First run timestamp and interval for a frequency
      *
-     * @return int Unix timestamp
+     * @param string $frequency Frequency value
+     * @return array{0: int, 1: int} [next timestamp, interval seconds]
      */
-    private static function next_slot(): int
+    private static function schedule_params(string $frequency): array
     {
+        if ('sixhourly' === $frequency) {
+            return [time() + 6 * HOUR_IN_SECONDS, 6 * HOUR_IN_SECONDS];
+        }
+        if ('twelvehourly' === $frequency) {
+            return [time() + 12 * HOUR_IN_SECONDS, 12 * HOUR_IN_SECONDS];
+        }
+
+        if ('daily' === $frequency) {
+            $slots = [0];
+            $interval = DAY_IN_SECONDS;
+        } elseif ('twicedaily' === $frequency) {
+            $slots = [0, 12];
+            $interval = 12 * HOUR_IN_SECONDS;
+        } else {
+            $slots = [0, 6, 12, 18];
+            $interval = 6 * HOUR_IN_SECONDS;
+        }
+
         $now = new \DateTimeImmutable('now', wp_timezone());
-        $slots = [0, 6, 12, 18];
 
         foreach ($slots as $hour) {
             $candidate = $now->setTime($hour, 0, 0);
             if ($candidate > $now) {
-                return $candidate->getTimestamp();
+                return [$candidate->getTimestamp(), $interval];
             }
         }
 
-        return $now->modify('tomorrow')->setTime(0, 0, 0)->getTimestamp();
+        return [$now->modify('tomorrow')->setTime(0, 0, 0)->getTimestamp(), $interval];
     }
 
     /**
      * Whether a run is in progress (1 hour lock)
      */
-    private function is_running(): bool
+    public function is_running(): bool
     {
         $lock = (int) get_option(self::OPT_LOCK, 0);
         return (time() - $lock) < HOUR_IN_SECONDS;
+    }
+
+    /**
+     * Next scheduled run timestamp
+     *
+     * @return int|false Unix timestamp or false when not scheduled
+     */
+    public function get_next_run()
+    {
+        return function_exists('as_next_scheduled_action')
+            ? as_next_scheduled_action(self::HOOK_RUN)
+            : false;
+    }
+
+    /**
+     * Stats of the last finished run
+     */
+    public function get_last_run(): ?array
+    {
+        $last = get_option(self::OPT_LAST, null);
+        return is_array($last) ? $last : null;
+    }
+
+    /**
+     * Last stored error
+     */
+    public function get_current_error(): ?array
+    {
+        $error = get_option(self::OPT_ERROR, null);
+        return is_array($error) ? $error : null;
     }
 
     /**
@@ -194,47 +315,51 @@ class MayreaSync
     }
 
     /**
-     * Download the API payload, leave a snapshot and chain the first batch
+     * Download the feed payload, leave a snapshot and chain the first batch
      */
     private function run(): void
     {
         if ($this->is_running()) {
-            $this->logger->info('Corrida omitida: ya hay una sincronización en curso.');
+            $this->logger->info('Feed run skipped: a sync is already in progress.');
             return;
         }
 
+        if (!$this->has_payload_config()) {
+            $this->set_error('External feed is not configured (URL and field mapping required).');
+            return;
+        }
+
+        $cfg = $this->get_config();
+
         update_option(self::OPT_LOCK, time(), false);
 
-        $endpoint = apply_filters('wc_api_sync_mayrea_api_url', self::API_URL);
-
         $response = wp_remote_get(
-            $endpoint,
+            $cfg['url'],
             [
                 'timeout'    => 60,
                 'blocking'   => true,
-                'sslverify'  => false,
-                'user-agent' => 'MayreaSync/' . WC_API_SYNC_VERSION,
+                'user-agent' => 'WC-API-Sync-Feed/' . WC_API_SYNC_VERSION,
                 'headers'    => ['Accept' => 'application/json'],
             ]
         );
 
         if (is_wp_error($response)) {
-            $this->set_error('No se pudo consultar la API: ' . $response->get_error_message());
+            $this->set_error('Feed request failed: ' . $response->get_error_message());
             delete_option(self::OPT_LOCK);
             return;
         }
 
         if (200 !== (int) wp_remote_retrieve_response_code($response)) {
-            $this->set_error('La API respondió HTTP ' . wp_remote_retrieve_response_code($response));
+            $this->set_error('Feed responded HTTP ' . wp_remote_retrieve_response_code($response));
             delete_option(self::OPT_LOCK);
             return;
         }
 
         $data = json_decode(wp_remote_retrieve_body($response), true);
 
-        if (!is_array($data) || count($data) < self::MIN_RECORDS) {
+        if (!is_array($data) || count($data) < $cfg['min_records']) {
             $this->set_error(
-                'Payload inválido o demasiado pequeño (' . (is_array($data) ? count($data) : 'no es array') . ' registros). Sincronización abortada para evitar dañar la tienda.'
+                'Invalid or too small payload (' . (is_array($data) ? count($data) : 'not an array') . ' records). Sync aborted to protect the store.'
             );
             delete_option(self::OPT_LOCK);
             return;
@@ -244,15 +369,15 @@ class MayreaSync
         $invalid = 0;
 
         foreach ($data as $row) {
-            $code = isset($row['codigoStProducto']) ? trim((string) $row['codigoStProducto']) : '';
+            $code = isset($row[$cfg['sku']]) ? trim((string) $row[$cfg['sku']]) : '';
 
             if ('' === $code) {
                 $invalid++;
                 continue;
             }
 
-            $price = isset($row['precioL4StConIva']) ? $row['precioL4StConIva'] : null;
-            $stock = isset($row['wStock']) ? $row['wStock'] : null;
+            $price = $row[$cfg['price']] ?? null;
+            $stock = $row[$cfg['stock']] ?? null;
 
             if (!is_numeric($price) || !is_numeric($stock)) {
                 $invalid++;
@@ -265,8 +390,8 @@ class MayreaSync
             ];
         }
 
-        if (count($items) < self::MIN_RECORDS) {
-            $this->set_error('Menos de ' . self::MIN_RECORDS . ' registros válidos tras normalizar. Sincronización abortada.');
+        if (count($items) < $cfg['min_records']) {
+            $this->set_error('Fewer than ' . $cfg['min_records'] . ' valid records after normalization. Sync aborted.');
             delete_option(self::OPT_LOCK);
             return;
         }
@@ -294,13 +419,13 @@ class MayreaSync
             false
         );
 
-        $this->logger->info('Corrida iniciada: ' . count($items) . ' registros en la API.');
+        $this->logger->info('Feed run started: ' . count($items) . ' records.');
 
         as_schedule_async_action(self::HOOK_BATCH, [0], self::GROUP);
     }
 
     /**
-     * Build the SKU => product ID map from postmeta
+     * Build the value => product ID map for the configured SKU field
      *
      * @return array<string, int[]>
      */
@@ -349,7 +474,7 @@ class MayreaSync
         $items = get_transient(self::TRANSIENT);
 
         if (!is_array($items) || empty($items)) {
-            $this->set_error('Snapshot expirado; la corrida se interrumpe. Se retomará en la próxima programación.');
+            $this->set_error('Snapshot expired; the run is interrupted. It will resume on the next schedule.');
             delete_option(self::OPT_LOCK);
             return;
         }
@@ -471,16 +596,16 @@ class MayreaSync
         delete_option(self::OPT_LOCK);
 
         $this->logger->info(
-            'Corrida finalizada en ' . $stats['duration'] . 's: '
-            . $stats['saved'] . ' productos guardados, '
-            . $stats['price_updates'] . ' precios, '
-            . $stats['stock_updates'] . ' stocks, '
-            . $stats['unmatched'] . ' SKUs sin match, '
-            . $stats['errors'] . ' errores.'
+            'Feed run finished in ' . $stats['duration'] . 's: '
+            . $stats['saved'] . ' products saved, '
+            . $stats['price_updates'] . ' prices, '
+            . $stats['stock_updates'] . ' stock, '
+            . $stats['unmatched'] . ' unmatched, '
+            . $stats['errors'] . ' errors.'
         );
 
         if (class_exists('LiteSpeed_Cache_API') && method_exists('LiteSpeed_Cache_API', 'purge_all')) {
-            LiteSpeed_Cache_API::purge_all('mayrea_sync');
+            LiteSpeed_Cache_API::purge_all('wc_api_sync_feed');
         }
     }
 }

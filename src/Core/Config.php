@@ -227,7 +227,7 @@ class Config
      */
     public function get_full_sync_interval(): int
     {
-        return (int) $this->get('full_sync_interval', 6);
+        return (int) $this->get('full_sync_interval', 0);
     }
 
     /**
@@ -237,7 +237,7 @@ class Config
      */
     public function get_incremental_sync_interval(): int
     {
-        return (int) $this->get('incremental_sync_interval', 5);
+        return (int) $this->get('incremental_sync_interval', 0);
     }
 
     /**

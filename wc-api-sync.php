@@ -139,8 +139,8 @@ register_activation_hook(__FILE__, function () {
         'image_webp' => true,
         'image_quality' => 80,
         'log_level' => 'info',
-        'full_sync_interval' => 6,
-        'incremental_sync_interval' => 5,
+        'full_sync_interval' => 0,
+        'incremental_sync_interval' => 0,
     ];
     $existing = get_option('wc_api_sync_settings', []);
     update_option('wc_api_sync_settings', wp_parse_args($existing, $defaults));

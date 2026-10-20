@@ -93,6 +93,7 @@ abstract class AbstractSync
     {
         // Register hooks
         add_action("wc_api_sync_full_sync_{$this->domain}", [$this, 'full_sync']);
+        add_action('wc_api_sync_incremental_sync', [$this, 'incremental_sync']);
         add_action("wc_api_sync_webhook_{$this->domain}.created", [$this, 'handle_created']);
         add_action("wc_api_sync_webhook_{$this->domain}.updated", [$this, 'handle_updated']);
         add_action("wc_api_sync_webhook_{$this->domain}.deleted", [$this, 'handle_deleted']);
@@ -155,6 +156,24 @@ abstract class AbstractSync
         $this->event_bus->emit("{$this->domain}.sync.completed", $results);
 
         return $results;
+    }
+
+    /**
+     * Scheduled incremental sync for this domain
+     *
+     * Items are matched against the state table so only new or modified
+     * records produce writes; skipped when the domain is disabled.
+     *
+     * @param array $payload Sync payload
+     * @return array Sync results
+     */
+    public function incremental_sync(array $payload = []): array
+    {
+        if (!$this->config->is_domain_enabled($this->domain)) {
+            return [];
+        }
+
+        return $this->full_sync($payload);
     }
 
     /**
