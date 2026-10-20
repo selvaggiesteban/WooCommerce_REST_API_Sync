@@ -8,6 +8,7 @@
 namespace WooCommerceApiSync\Core;
 
 use WooCommerceApiSync\API\WooCommerceClient;
+use WooCommerceApiSync\Features\MayreaSync;
 
 defined('ABSPATH') || exit;
 
@@ -21,6 +22,7 @@ class Plugin
     private ?WooCommerceClient $api_client = null;
     private ?EventBus $event_bus = null;
     private ?Queue $queue = null;
+    private ?MayreaSync $mayrea = null;
 
     public static function instance(): Plugin
     {
@@ -45,6 +47,15 @@ class Plugin
             $this->api_client = new WooCommerceClient($this->config);
         } catch (\Exception $e) {
             error_log('WC-API-Sync init error: ' . $e->getMessage());
+        }
+
+        if (null !== $this->queue) {
+            try {
+                $this->mayrea = new MayreaSync($this->queue);
+                $this->mayrea->init();
+            } catch (\Exception $e) {
+                error_log('WC-API-Sync mayrea feature error: ' . $e->getMessage());
+            }
         }
 
         $this->init_admin();
@@ -157,7 +168,7 @@ class Plugin
                 'args' => [
                     'domain' => [
                         'required' => true,
-                        'enum' => ['products', 'orders', 'customers', 'taxes', 'shipping', 'payments', 'coupons', 'reports', 'settings', 'webhooks', 'media'],
+                        'enum' => ['products', 'orders', 'customers', 'taxes', 'shipping', 'payments', 'coupons', 'reports', 'settings', 'webhooks', 'media', 'mayrea'],
                     ],
                 ],
             ]);
@@ -175,7 +186,15 @@ class Plugin
             return new \WP_REST_Response(['success' => false, 'message' => 'Queue not initialized'], 500);
         }
 
-        $job_id = $this->queue->add_job('full_sync', ['domain' => $domain]);
+        if ('mayrea' === $domain) {
+            if (null === $this->mayrea) {
+                return new \WP_REST_Response(['success' => false, 'message' => 'Mayrea feature not initialized'], 500);
+            }
+
+            $job_id = $this->mayrea->enqueue_job('rest');
+        } else {
+            $job_id = $this->queue->add_job('full_sync', ['domain' => $domain]);
+        }
 
         return new \WP_REST_Response([
             'success' => true,
